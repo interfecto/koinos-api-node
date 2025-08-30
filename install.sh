@@ -4,7 +4,20 @@
 # Usage: curl -sSL https://your-domain.com/install-koinos.sh | bash
 # Or: wget -qO- https://your-domain.com/install-koinos.sh | bash
 
-set -e  # Exit on any error
+set -euo pipefail  # Exit on error, undefined variables, and pipe failures
+
+# Cleanup function for interrupts
+cleanup() {
+    print_warning "Installation interrupted. Cleaning up..."
+    # Kill any background aria2c processes
+    pkill aria2c 2>/dev/null || true
+    # Remove temporary files
+    rm -f /tmp/download_with_timeout.sh /tmp/aria2c_speed.log /tmp/aria2c.pid 2>/dev/null || true
+    exit 1
+}
+
+# Set trap for cleanup on script exit/interrupt
+trap cleanup INT TERM
 
 echo "=================================="
 echo "🚀 Koinos API Node Installer"
@@ -40,16 +53,37 @@ if [[ $EUID -eq 0 ]]; then
    exit 1
 fi
 
-# Check operating system
-if ! grep -q "Ubuntu\|Debian" /etc/os-release; then
-    print_error "This installer supports Ubuntu and Debian only."
-    exit 1
+# Check operating system compatibility
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    if ! echo "$ID $ID_LIKE" | grep -qE "ubuntu|debian"; then
+        print_warning "This installer is optimized for Ubuntu and Debian."
+        print_status "Detected: ${PRETTY_NAME:-Unknown}"
+        read -p "Continue anyway? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+    fi
+else
+    print_warning "Cannot detect OS version"
+    read -p "Continue anyway? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
 fi
 
 print_status "Checking system requirements..."
 
 # Check available disk space - be smart about requirements
-AVAILABLE_SPACE=$(df / | awk 'NR==2 {print int($4/1024/1024)}')
+AVAILABLE_SPACE=$(df "$HOME" 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}' || df / | awk 'NR==2 {print int($4/1024/1024)}')
+
+# Make sure we got a valid number
+if [ -z "$AVAILABLE_SPACE" ] || [ "$AVAILABLE_SPACE" -eq 0 ]; then
+    print_warning "Could not determine available disk space, continuing anyway..."
+    AVAILABLE_SPACE=999999  # Set to large number to skip check
+fi
 
 # Check if blockchain data already exists (then we need less space)
 if [ -d "$HOME/.koinos/chain" ] || [ -d "$HOME/chain" ]; then
@@ -58,14 +92,15 @@ if [ -d "$HOME/.koinos/chain" ] || [ -d "$HOME/chain" ]; then
     print_status "Found existing blockchain data, checking for ${REQUIRED_SPACE}GB free space..."
 else
     # Need space for download + extraction + final data
-    REQUIRED_SPACE=100
+    REQUIRED_SPACE=80  # Reduced from 100 since we delete archive immediately after extraction
     print_status "No blockchain data found, checking for ${REQUIRED_SPACE}GB free space for full installation..."
 fi
 
 if [ $AVAILABLE_SPACE -lt $REQUIRED_SPACE ]; then
     print_error "Insufficient disk space. Need at least ${REQUIRED_SPACE}GB free, found ${AVAILABLE_SPACE}GB"
-    if [ $REQUIRED_SPACE -eq 100 ]; then
-        print_status "Tip: 100GB needed for: 30GB download + 30GB extraction + 30GB final data + buffer"
+    if [ $REQUIRED_SPACE -eq 80 ]; then
+        print_status "Tip: 80GB needed for: 30GB download + 30GB extraction + 30GB final data"
+        print_status "Note: Archive is deleted immediately after extraction to save space"
     else
         print_status "Tip: Since you have existing data, only ${REQUIRED_SPACE}GB needed for Docker operations"
     fi
@@ -97,9 +132,34 @@ install_docker() {
     sudo mkdir -m 0755 -p /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     
-    # Add Docker repository
+    # Add Docker repository (detect Ubuntu vs Debian)
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            ubuntu)
+                DOCKER_DISTRO="ubuntu"
+                ;;
+            debian)
+                DOCKER_DISTRO="debian"
+                ;;
+            *)
+                # Try to detect based on ID_LIKE
+                if echo "$ID_LIKE" | grep -q "ubuntu"; then
+                    DOCKER_DISTRO="ubuntu"
+                elif echo "$ID_LIKE" | grep -q "debian"; then
+                    DOCKER_DISTRO="debian"
+                else
+                    print_warning "Unknown distribution, defaulting to Ubuntu repository"
+                    DOCKER_DISTRO="ubuntu"
+                fi
+                ;;
+        esac
+    else
+        DOCKER_DISTRO="ubuntu"
+    fi
+    
     echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$DOCKER_DISTRO \
       $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
     
     # Install Docker
@@ -147,12 +207,20 @@ setup_koinos() {
     # Clone repository
     cd $HOME
     if [ -d "koinos" ]; then
-        print_warning "Koinos directory already exists. Backing it up..."
-        mv koinos koinos_backup_$(date +%Y%m%d_%H%M%S)
+        # Check if it's a valid Koinos installation
+        if [ -f "koinos/docker-compose.yml" ]; then
+            print_status "Koinos directory already exists, using existing installation..."
+            cd koinos
+        else
+            print_warning "Koinos directory exists but seems incomplete. Backing it up..."
+            mv koinos koinos_backup_$(date +%Y%m%d_%H%M%S)
+            git clone https://github.com/koinos/koinos
+            cd koinos
+        fi
+    else
+        git clone https://github.com/koinos/koinos
+        cd koinos
     fi
-    
-    git clone https://github.com/koinos/koinos
-    cd koinos
     
     # Copy configuration files
     cp -r config-example config
@@ -171,7 +239,7 @@ setup_koinos() {
 
 # Performance optimizations
 KOINOS_LOG_LEVEL=warn
-KOINOS_JOBS=$(nproc)
+KOINOS_JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 KOINOS_LOG_JSON=false
 EOF
     
@@ -201,7 +269,10 @@ events {
 
 http {
     upstream koinos_jsonrpc {
-        server host.docker.internal:8080;
+        # Use host.docker.internal for Docker Desktop, fallback to bridge IP for Linux
+        server host.docker.internal:8080 max_fails=2 fail_timeout=10s;
+        # Backup: direct bridge network IP (will be ignored if first works)
+        server 172.17.0.1:8080 backup max_fails=2 fail_timeout=10s;
     }
     
     server {
@@ -295,8 +366,8 @@ download_snapshot() {
     
     print_status "Checking for existing checkpoints..."
     
-    # Get latest snapshot
-    LATEST=$(curl -s https://backup.koinosblocks.com/ | grep -oP 'backup_\d{4}-\d{2}-\d{2}\.tar\.gz' | sort | tail -n 1)
+    # Get latest snapshot (compatible with macOS and Linux grep)
+    LATEST=$(curl -s https://backup.koinosblocks.com/ | sed -n 's/.*\(backup_[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\.tar\.gz\).*/\1/p' | sort | tail -n 1)
     
     if [ -z "$LATEST" ]; then
         print_error "Could not find latest snapshot"
@@ -363,7 +434,15 @@ download_snapshot() {
     fi
     
     # Only check disk space if we actually need to download
-    AVAILABLE_SPACE=$(df . | awk 'NR==2 {print int($4/1024/1024)}')
+    # Handle both Linux and macOS df output formats
+    if df -BG . >/dev/null 2>&1; then
+        # Linux format with -BG flag
+        AVAILABLE_SPACE=$(df -BG . | awk 'NR==2 {print int($4)}')
+    else
+        # macOS/BSD format - convert KB to GB
+        AVAILABLE_KB=$(df . | awk 'NR==2 {print $4}')
+        AVAILABLE_SPACE=$((AVAILABLE_KB / 1024 / 1024))
+    fi
     if [ $AVAILABLE_SPACE -lt 60 ]; then
         print_error "Insufficient disk space for snapshot. Need at least 60GB free, found ${AVAILABLE_SPACE}GB"
         print_status "Tip: The snapshot is ~30GB compressed and needs ~30GB more for extraction"
@@ -387,19 +466,33 @@ download_snapshot() {
         fi
     fi
     
+    # Initialize flags
+    SKIP_DOWNLOAD=false
+    SKIP_EXTRACTION=false
+    DOWNLOAD_SUCCESS=false
+    
+    # Set default values for important variables
+    HOME=${HOME:-/home/$USER}
+    USER=${USER:-$(whoami)}
+    LATEST=""
+    REQUIRED_SPACE=80
+    
     # Check if we already have extracted data from a previous attempt
-    if [ -d "$HOME/backup" ] || [ -d "$HOME/${LATEST%.*.*}" ] || ([ -d "$HOME/chain" ] && [ -d "$HOME/block_store" ]); then
-        print_status "Found previously extracted data, skipping download..."
-        DOWNLOAD_SUCCESS=true
-        SKIP_DOWNLOAD=true
-    elif [ -d "$HOME/.koinos/chain" ] && [ -d "$HOME/.koinos/block_store" ]; then
+    if [ -d "$HOME/.koinos/chain" ] && [ -d "$HOME/.koinos/block_store" ]; then
         print_status "Found completed blockchain data in ~/.koinos, skipping download and extraction..."
         DOWNLOAD_SUCCESS=true
         SKIP_DOWNLOAD=true
         SKIP_EXTRACTION=true
-    else
-        SKIP_DOWNLOAD=false
-        SKIP_EXTRACTION=false
+    elif [ -d "$HOME/chain" ] && [ -d "$HOME/block_store" ]; then
+        print_status "Found extracted blockchain directories, skipping download..."
+        DOWNLOAD_SUCCESS=true
+        SKIP_DOWNLOAD=true
+        SKIP_EXTRACTION=false  # Still need to move them
+    elif [ -d "$HOME/backup" ] || [ -d "$HOME/${LATEST%.*.*}" ]; then
+        print_status "Found previously extracted backup directory, skipping download..."
+        DOWNLOAD_SUCCESS=true
+        SKIP_DOWNLOAD=true
+        SKIP_EXTRACTION=false  # Still need to move them
     fi
     
     # Install aria2c for faster downloads if not present
@@ -632,7 +725,7 @@ EOFD
                 print_status "Extraction attempt $((RETRY_COUNT + 1)) of $MAX_RETRIES..."
                 
                 # Determine number of CPU cores for parallel extraction
-                CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+                CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
                 
                 # Use pigz for MUCH faster parallel extraction if available
                 if command -v pigz >/dev/null 2>&1 && command -v pv >/dev/null 2>&1; then
@@ -852,8 +945,17 @@ start_node() {
     
     cd $HOME/koinos
     
-    # Start with new group membership (Docker group)
-    sg docker -c "docker compose --profile all up -d"
+    # Start with new group membership (Docker group) if sg is available
+    if command -v sg >/dev/null 2>&1; then
+        sg docker -c "docker compose --profile all up -d"
+    else
+        # Fallback for systems without sg command (macOS, some Linux distros)
+        print_status "Starting without sg command..."
+        docker compose --profile all up -d || {
+            print_warning "May need to logout/login for Docker group changes to take effect"
+            docker compose --profile all up -d
+        }
+    fi
     
     print_success "Koinos node started"
 }
