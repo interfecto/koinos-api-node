@@ -129,11 +129,10 @@ configure_firewall() {
         sudo ufw allow ssh
         
         # Allow Koinos ports
-        sudo ufw allow 8081/tcp comment 'Koinos CORS API'
         sudo ufw allow 8080/tcp comment 'Koinos JSON-RPC'
+        sudo ufw allow 8081/tcp comment 'Koinos CORS Proxy'
         sudo ufw allow 8888/tcp comment 'Koinos P2P'
         sudo ufw allow 50051/tcp comment 'Koinos gRPC'
-        sudo ufw allow 3000/tcp comment 'Koinos REST'
         
         print_success "Firewall configured"
     else
@@ -179,101 +178,104 @@ EOF
     print_success "Koinos configuration completed"
 }
 
-# Function to setup CORS proxy
+# Function to setup CORS proxy as a separate Docker container
 setup_cors_proxy() {
-    print_status "Setting up CORS proxy..."
+    print_status "Setting up CORS proxy for browser access..."
     
-    # Create Dockerfile
+    # Create a separate directory for CORS proxy
+    mkdir -p ~/koinos-cors-proxy
+    cd ~/koinos-cors-proxy
+    
+    # Create Dockerfile for CORS proxy
     cat > Dockerfile << 'EOF'
 FROM nginx:alpine
+RUN rm /etc/nginx/conf.d/default.conf
 COPY nginx.conf /etc/nginx/nginx.conf
 EOF
     
-    # Create nginx.conf
+    # Create nginx configuration with CORS headers
     cat > nginx.conf << 'EOF'
 events {
     worker_connections 1024;
-    use epoll;
 }
 
 http {
-    # Rate limiting
-    limit_req_zone $binary_remote_addr zone=api:10m rate=20r/s;
-    
-    # Connection pooling
-    upstream jsonrpc_backend {
-        server jsonrpc:8080 max_fails=3 fail_timeout=30s;
-        keepalive 32;
+    upstream koinos_jsonrpc {
+        server host.docker.internal:8080;
     }
     
     server {
         listen 8081;
         
-        # Increase timeouts
-        proxy_connect_timeout 10s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
-        
-        # Enable compression
-        gzip on;
-        gzip_types application/json text/plain;
-        
-        # Rate limiting
-        limit_req zone=api burst=50 nodelay;
-        
         location / {
-            proxy_pass http://jsonrpc_backend;
+            # CORS headers
+            add_header 'Access-Control-Allow-Origin' '*' always;
+            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS' always;
+            add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range' always;
+            add_header 'Access-Control-Expose-Headers' 'Content-Length,Content-Range' always;
+            
+            # Handle preflight requests
+            if ($request_method = 'OPTIONS') {
+                add_header 'Access-Control-Allow-Origin' '*';
+                add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS';
+                add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range';
+                add_header 'Access-Control-Max-Age' 1728000;
+                add_header 'Content-Type' 'text/plain; charset=utf-8';
+                add_header 'Content-Length' 0;
+                return 204;
+            }
+            
+            # Proxy to Koinos JSON-RPC
+            proxy_pass http://koinos_jsonrpc;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header Connection "";
-            proxy_http_version 1.1;
-            
-            # CORS headers
-            add_header 'Access-Control-Allow-Origin' '*' always;
-            add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, PUT, DELETE' always;
-            add_header 'Access-Control-Allow-Headers' '*' always;
-            
-            if ($request_method = OPTIONS ) {
-                add_header 'Access-Control-Allow-Origin' '*';
-                add_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, PUT, DELETE';
-                add_header 'Access-Control-Allow-Headers' '*';
-                add_header 'Content-Length' 0;
-                add_header 'Content-Type' 'text/plain charset=UTF-8';
-                return 204;
-            }
+            proxy_set_header X-Forwarded-Proto $scheme;
         }
         
         location /health {
-            return 200 "OK\n";
+            access_log off;
+            return 200 "healthy\n";
             add_header Content-Type text/plain;
         }
     }
 }
 EOF
     
-    # Update docker-compose.yml to include CORS proxy
-    cat >> docker-compose.yml << 'EOF'
+    # Create docker-compose.yml for CORS proxy (separate from main Koinos)
+    cat > docker-compose.yml << 'EOF'
+version: '3.8'
 
-   cors-proxy:
-      build: .
-      restart: always
-      profiles: ["jsonrpc", "api", "all"]
-      depends_on:
-         - jsonrpc
-      ports:
-         - "8081:8081"
-      deploy:
-         resources:
-            limits:
-               memory: 512M
-               cpus: '0.5'
-            reservations:
-               memory: 256M
-               cpus: '0.25'
+services:
+  cors-proxy:
+    build: .
+    container_name: koinos-cors-proxy
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 EOF
     
-    print_success "CORS proxy configured"
+    # Build and start the CORS proxy
+    print_status "Building CORS proxy container..."
+    if docker compose build; then
+        print_status "Starting CORS proxy..."
+        if docker compose up -d; then
+            print_success "CORS proxy started on port 8081"
+        else
+            print_warning "Failed to start CORS proxy, but node will still work on port 8080"
+        fi
+    else
+        print_warning "Failed to build CORS proxy, but node will still work on port 8080"
+    fi
+    
+    cd ~/koinos
 }
 
 # Function to download blockchain snapshot
@@ -909,10 +911,10 @@ main() {
     echo "Your Koinos API node is now running!"
     echo
     echo "API Endpoints:"
-    echo "• CORS Proxy (recommended): http://$(curl -s ifconfig.me):8081"
-    echo "• JSON-RPC Direct: http://$(curl -s ifconfig.me):8080"
+    echo "• JSON-RPC: http://$(curl -s ifconfig.me):8080"
+    echo "• CORS Proxy (for browsers): http://$(curl -s ifconfig.me):8081"
     echo "• gRPC: http://$(curl -s ifconfig.me):50051"
-    echo "• REST API: http://$(curl -s ifconfig.me):3000"
+    echo "• P2P: port 8888"
     echo
     echo "Management Commands:"
     echo "• Check status: ~/koinos-status.sh"
