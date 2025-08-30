@@ -390,14 +390,15 @@ EOF
 download_snapshot() {
     print_status "Starting blockchain snapshot download process..."
     
-    # ============================================================
-    # CHECKPOINT SYSTEM - Resume from where we left off
-    # ============================================================
-    # Check 1: Is extraction already complete? → Skip everything
-    # Check 2: Is download complete? → Skip download, go to extraction  
-    # Check 3: Is download partial? → Resume download
-    # Check 4: Is extraction partial? → Resume extraction
-    # ============================================================
+    # Initialize flags FIRST
+    SKIP_DOWNLOAD=false
+    SKIP_EXTRACTION=false
+    DOWNLOAD_SUCCESS=false
+    
+    # Set default values for important variables
+    HOME=${HOME:-/home/$USER}
+    USER=${USER:-$(whoami)}
+    REQUIRED_SPACE=80
     
     cd $HOME
     
@@ -503,33 +504,27 @@ download_snapshot() {
         fi
     fi
     
-    # Initialize flags
-    SKIP_DOWNLOAD=false
-    SKIP_EXTRACTION=false
-    DOWNLOAD_SUCCESS=false
+    # Decide what to do based on existing data
+    # Priority: 1) Complete data in ~/.koinos 2) Extracted dirs 3) Archive file 4) Nothing
     
-    # Set default values for important variables
-    HOME=${HOME:-/home/$USER}
-    USER=${USER:-$(whoami)}
-    LATEST=""
-    REQUIRED_SPACE=80
-    
-    # Check if we already have extracted data from a previous attempt
-    if [ -d "$HOME/.koinos/chain" ] && [ -d "$HOME/.koinos/block_store" ]; then
-        print_status "Found completed blockchain data in ~/.koinos, skipping download and extraction..."
-        DOWNLOAD_SUCCESS=true
+    # If we have a backup directory but no archive file, we still need to organize it
+    if [ -d "$HOME/backup" ] && [ ! -f "$LATEST" ]; then
+        print_status "Found backup directory without archive file, will organize it..."
+        SKIP_DOWNLOAD=true  # Don't need to download
+        SKIP_EXTRACTION=true  # Already extracted
+        DOWNLOAD_SUCCESS=true  # Consider it successful
+        # Will move the backup directory later
+    elif [ -d "$HOME/chain" ] && [ -d "$HOME/block_store" ] && [ ! -f "$LATEST" ]; then
+        print_status "Found extracted blockchain directories without archive, will organize them..."
         SKIP_DOWNLOAD=true
         SKIP_EXTRACTION=true
-    elif [ -d "$HOME/chain" ] && [ -d "$HOME/block_store" ]; then
-        print_status "Found extracted blockchain directories, skipping download..."
         DOWNLOAD_SUCCESS=true
-        SKIP_DOWNLOAD=true
-        SKIP_EXTRACTION=false  # Still need to move them
-    elif [ -d "$HOME/backup" ] || [ -d "$HOME/${LATEST%.*.*}" ]; then
-        print_status "Found previously extracted backup directory, skipping download..."
-        DOWNLOAD_SUCCESS=true
-        SKIP_DOWNLOAD=true
-        SKIP_EXTRACTION=false  # Still need to move them
+        # Will move these directories later
+    else
+        # Normal download flow - need the archive file
+        SKIP_DOWNLOAD=false
+        SKIP_EXTRACTION=false
+        DOWNLOAD_SUCCESS=false
     fi
     
     # Install aria2c for faster downloads if not present
@@ -705,9 +700,9 @@ EOFD
         DOWNLOAD_SUCCESS=true
     fi
     
-    # Verify download completed
-    if [ ! -f "$LATEST" ]; then
-        print_error "Download failed - file not found"
+    # Verify download completed (only if we were supposed to download)
+    if [ "$SKIP_DOWNLOAD" = false ] && [ ! -f "$LATEST" ]; then
+        print_error "Download failed - file not found after download attempts"
         exit 1
     fi
     
@@ -853,9 +848,12 @@ EOFD
     fi
     
     # Move to correct location - check various possible extraction patterns
+    # This should run whether we downloaded or found existing directories
     if [ -d "backup" ]; then
         print_status "Moving 'backup' directory to ~/.koinos..."
+        rm -rf ~/.koinos 2>/dev/null  # Remove any incomplete data
         mv backup ~/.koinos
+        print_success "Blockchain data moved to ~/.koinos"
     elif [ -d "${LATEST%.*.*}" ]; then
         print_status "Moving '${LATEST%.*.*}' directory to ~/.koinos..."
         mv "${LATEST%.*.*}" ~/.koinos
