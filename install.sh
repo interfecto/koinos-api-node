@@ -285,43 +285,173 @@ download_snapshot() {
     
     # Install aria2c for faster downloads if not present
     if ! command -v aria2c >/dev/null 2>&1 && ! command -v axel >/dev/null 2>&1; then
-        print_status "Installing aria2c for faster multi-connection downloads..."
+        print_status "Installing download accelerators for faster speeds..."
         sudo apt-get update >/dev/null 2>&1
-        sudo apt-get install -y aria2 >/dev/null 2>&1 || true
+        sudo apt-get install -y aria2 axel >/dev/null 2>&1 || true
+    fi
+    
+    # Install bc for speed calculations if not present
+    if ! command -v bc >/dev/null 2>&1; then
+        sudo apt-get install -y bc >/dev/null 2>&1 || true
     fi
     
     # Try different download methods for better speed
+    DOWNLOAD_SUCCESS=false
+    
     if command -v aria2c >/dev/null 2>&1; then
         print_status "Using aria2c for faster multi-connection download..."
-        # Use 16 connections for much faster downloads
-        aria2c -x 16 -s 16 -k 1M --file-allocation=none \
-               --console-log-level=error \
-               --summary-interval=10 \
-               -o $LATEST \
-               https://backup.koinosblocks.com/$LATEST
-    elif command -v axel >/dev/null 2>&1; then
-        print_status "Using axel for faster multi-connection download..."
-        # Use 10 connections for faster downloads
-        axel -n 10 -a -o $LATEST https://backup.koinosblocks.com/$LATEST
-    elif command -v curl >/dev/null 2>&1; then
-        print_status "Using curl for download..."
-        # Curl with optimized settings
-        curl -L --progress-bar \
-             --retry 3 \
-             --retry-delay 5 \
-             --max-time 7200 \
-             --speed-limit 1000 \
-             --speed-time 60 \
-             -o $LATEST \
-             https://backup.koinosblocks.com/$LATEST
-    else
-        print_status "Using wget for download..."
-        # Wget with optimized settings
+        
+        # Try up to 3 times with different connection counts
+        for attempt in 1 2 3; do
+            case $attempt in
+                1) CONNECTIONS=16; SPLITS=16 ;;  # Try aggressive first
+                2) CONNECTIONS=8; SPLITS=8 ;;     # Then moderate
+                3) CONNECTIONS=4; SPLITS=4 ;;     # Then conservative
+            esac
+            
+            print_status "Download attempt $attempt of 3 (using $CONNECTIONS connections)..."
+            
+            # Create a wrapper script to monitor speed
+            cat > /tmp/download_with_timeout.sh << 'EOFD'
+#!/bin/bash
+LOGFILE="/tmp/aria2c_speed.log"
+PID_FILE="/tmp/aria2c.pid"
+MIN_SPEED_MB=1  # Minimum acceptable speed in MB/s
+CHECK_AFTER=30  # Start checking speed after 30 seconds
+
+# Start aria2c in background and capture its PID
+aria2c "$@" 2>&1 | tee $LOGFILE &
+ARIA_PID=$!
+echo $ARIA_PID > $PID_FILE
+
+# Let it stabilize for initial period
+sleep $CHECK_AFTER
+
+# Monitor speed
+SLOW_COUNT=0
+while kill -0 $ARIA_PID 2>/dev/null; do
+    # Extract current speed from aria2c output
+    CURRENT_SPEED=$(tail -n 5 $LOGFILE | grep -oP 'DL:[\d.]+[KMG]iB' | tail -1 | grep -oP '[\d.]+[KMG]' | tail -1)
+    
+    if [ -n "$CURRENT_SPEED" ]; then
+        # Convert to MB/s for comparison
+        UNIT=$(echo $CURRENT_SPEED | grep -oP '[KMG]')
+        SPEED_VAL=$(echo $CURRENT_SPEED | grep -oP '[\d.]+')
+        
+        case $UNIT in
+            K) SPEED_MB=$(echo "$SPEED_VAL / 1024" | bc -l) ;;
+            M) SPEED_MB=$SPEED_VAL ;;
+            G) SPEED_MB=$(echo "$SPEED_VAL * 1024" | bc -l) ;;
+            *) SPEED_MB=0 ;;
+        esac
+        
+        # Check if speed is too slow
+        if (( $(echo "$SPEED_MB < $MIN_SPEED_MB" | bc -l) )); then
+            SLOW_COUNT=$((SLOW_COUNT + 1))
+            if [ $SLOW_COUNT -ge 3 ]; then
+                echo "Speed too slow ($CURRENT_SPEED), killing download..."
+                kill $ARIA_PID 2>/dev/null
+                exit 1
+            fi
+        else
+            SLOW_COUNT=0  # Reset if speed is good
+        fi
+    fi
+    sleep 10
+done
+
+wait $ARIA_PID
+EXIT_CODE=$?
+rm -f $LOGFILE $PID_FILE
+exit $EXIT_CODE
+EOFD
+            chmod +x /tmp/download_with_timeout.sh
+            
+            # Run download with monitoring
+            if /tmp/download_with_timeout.sh \
+                   -x $CONNECTIONS -s $SPLITS -k 10M \
+                   --min-split-size=10M \
+                   --max-connection-per-server=$CONNECTIONS \
+                   --file-allocation=falloc \
+                   --max-tries=5 \
+                   --retry-wait=5 \
+                   --continue=true \
+                   --auto-file-renaming=false \
+                   --allow-overwrite=true \
+                   --console-log-level=warn \
+                   --summary-interval=10 \
+                   --human-readable=true \
+                   --max-download-limit=0 \
+                   --disable-ipv6=true \
+                   --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                   --timeout=60 \
+                   --connect-timeout=60 \
+                   --lowest-speed-limit=1M \
+                   -o $LATEST \
+                   https://backup.koinosblocks.com/$LATEST; then
+                DOWNLOAD_SUCCESS=true
+                print_success "Download completed successfully!"
+                break
+            else
+                print_warning "Download attempt $attempt failed or was too slow"
+                
+                # If file exists and is substantial, check if we should continue
+                if [ -f "$LATEST" ]; then
+                    CURRENT_SIZE=$(stat -c%s "$LATEST" 2>/dev/null || stat -f%z "$LATEST" 2>/dev/null || echo 0)
+                    EXPECTED_SIZE=$((30 * 1024 * 1024 * 1024))  # ~30GB
+                    
+                    if [ "$CURRENT_SIZE" -gt $((EXPECTED_SIZE * 8 / 10)) ]; then
+                        print_status "Download is 80% complete, continuing with current file..."
+                        continue
+                    else
+                        print_status "Partial download is only $(($CURRENT_SIZE / 1024 / 1024))MB, retrying..."
+                        rm -f $LATEST
+                        # Wait a bit before retry
+                        sleep 5
+                    fi
+                fi
+            fi
+        done
+        
+        rm -f /tmp/download_with_timeout.sh
+    fi
+    
+    
+    if [ "$DOWNLOAD_SUCCESS" = false ]; then
+        if command -v axel >/dev/null 2>&1; then
+            print_status "Trying axel for multi-connection download..."
+            if axel -n 8 -a -o $LATEST https://backup.koinosblocks.com/$LATEST; then
+                DOWNLOAD_SUCCESS=true
+            else
+                rm -f $LATEST
+            fi
+        fi
+    fi
+    
+    if [ "$DOWNLOAD_SUCCESS" = false ]; then
+        if command -v curl >/dev/null 2>&1; then
+            print_status "Trying curl for download..."
+            if curl -L --progress-bar \
+                 --retry 3 \
+                 --retry-delay 5 \
+                 --max-time 7200 \
+                 -o $LATEST \
+                 https://backup.koinosblocks.com/$LATEST; then
+                DOWNLOAD_SUCCESS=true
+            else
+                rm -f $LATEST
+            fi
+        fi
+    fi
+    
+    if [ "$DOWNLOAD_SUCCESS" = false ]; then
+        print_status "Using wget as final fallback..."
         wget --progress=bar:force \
              --tries=3 \
              --timeout=60 \
              --continue \
              https://backup.koinosblocks.com/$LATEST -O $LATEST
+        DOWNLOAD_SUCCESS=true
     fi
     
     # Verify download completed
