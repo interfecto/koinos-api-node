@@ -507,6 +507,13 @@ download_snapshot() {
     # Decide what to do based on existing data
     # Priority: 1) Complete data in ~/.koinos 2) Extracted dirs 3) Archive file 4) Nothing
     
+    # Check if final destination already has complete data
+    if [ -d "$HOME/.koinos/chain" ] && [ -d "$HOME/.koinos/block_store" ]; then
+        print_success "Blockchain data already installed at ~/.koinos!"
+        print_status "Skipping download and extraction..."
+        return 0  # Exit function early - nothing to do
+    fi
+    
     # If we have a backup directory but no archive file, we still need to organize it
     if [ -d "$HOME/backup" ] && [ ! -f "$LATEST" ]; then
         print_status "Found backup directory without archive file, will organize it..."
@@ -706,27 +713,28 @@ EOFD
         exit 1
     fi
     
-    # Check if extraction was already done or partially done
-    EXTRACTION_NEEDED=true
-    if [ -d "$HOME/backup" ]; then
-        print_status "Found 'backup' directory from previous extraction attempt..."
-        BACKUP_SIZE=$(du -sm "$HOME/backup" 2>/dev/null | cut -f1)
-        if [ "$BACKUP_SIZE" -gt 20000 ]; then  # If > 20GB, probably complete
-            print_success "Extraction appears complete (${BACKUP_SIZE}MB), skipping..."
+    # Check if extraction is needed (only if we have an archive file)
+    EXTRACTION_NEEDED=false
+    if [ -f "$LATEST" ] && [ "$SKIP_EXTRACTION" = false ]; then
+        # We have an archive and haven't marked extraction as skipped
+        EXTRACTION_NEEDED=true
+        
+        # But check if it's already been extracted
+        if [ -d "$HOME/backup" ]; then
+            BACKUP_SIZE=$(du -sm "$HOME/backup" 2>/dev/null | cut -f1)
+            if [ "$BACKUP_SIZE" -gt 20000 ]; then  # If > 20GB, probably complete
+                print_success "Extraction appears complete (${BACKUP_SIZE}MB), skipping..."
+                EXTRACTION_NEEDED=false
+            else
+                print_warning "Partial extraction found (${BACKUP_SIZE}MB), will resume..."
+            fi
+        elif [ -d "$HOME/${LATEST%.*.*}" ]; then
+            print_status "Found extracted directory from previous attempt..."
             EXTRACTION_NEEDED=false
-        else
-            print_warning "Partial extraction found (${BACKUP_SIZE}MB), will resume..."
-            # Keep the partial extraction, tar will skip existing files
+        elif [ -d "$HOME/chain" ] && [ -d "$HOME/block_store" ]; then
+            print_status "Found extracted blockchain directories..."
+            EXTRACTION_NEEDED=false
         fi
-    elif [ -d "$HOME/${LATEST%.*.*}" ]; then
-        print_status "Found extracted directory from previous attempt..."
-        EXTRACTION_NEEDED=false
-    elif [ -d "$HOME/chain" ] && [ -d "$HOME/block_store" ]; then
-        print_status "Found extracted blockchain directories in home folder..."
-        EXTRACTION_NEEDED=false
-    elif [ -d "$HOME/.koinos/chain" ] && [ -d "$HOME/.koinos/block_store" ]; then
-        print_success "Blockchain data already in place at ~/.koinos, skipping extraction..."
-        EXTRACTION_NEEDED=false
     fi
     
     if [ "$EXTRACTION_NEEDED" = true ] && [ -f "$LATEST" ]; then
@@ -843,8 +851,6 @@ EOFD
             rm -f $LATEST
             rm -f "${LATEST}.backup" 2>/dev/null
         fi
-    else
-        print_warning "No archive file found to extract"
     fi
     
     # Move to correct location - check various possible extraction patterns
@@ -894,11 +900,18 @@ EOFD
             print_status "Current directory contents:"
             ls -la
             print_status "Expected to find directories like: chain, block_store, account_history"
-            exit 1
+            # Don't exit if we're just missing data - let the node sync from scratch
+            print_warning "Will proceed without snapshot - node will sync from genesis (takes longer)"
+            return 0
         fi
     fi
     
-    print_success "Blockchain snapshot installed and archive cleaned up"
+    # Final verification
+    if [ -d "$HOME/.koinos/chain" ] || [ -d "$HOME/.koinos/block_store" ]; then
+        print_success "Blockchain snapshot installed successfully!"
+    else
+        print_warning "Snapshot installation may have issues, but continuing..."
+    fi
 }
 
 # Function to create management scripts
