@@ -261,9 +261,20 @@ EOF
 
 # Function to download blockchain snapshot
 download_snapshot() {
-    print_status "Downloading blockchain snapshot (this may take a while)..."
+    print_status "Starting blockchain snapshot download process..."
+    
+    # ============================================================
+    # CHECKPOINT SYSTEM - Resume from where we left off
+    # ============================================================
+    # Check 1: Is extraction already complete? → Skip everything
+    # Check 2: Is download complete? → Skip download, go to extraction  
+    # Check 3: Is download partial? → Resume download
+    # Check 4: Is extraction partial? → Resume extraction
+    # ============================================================
     
     cd $HOME
+    
+    print_status "Checking for existing checkpoints..."
     
     # Get latest snapshot
     LATEST=$(curl -s https://backup.koinosblocks.com/ | grep -oP 'backup_\d{4}-\d{2}-\d{2}\.tar\.gz' | sort | tail -n 1)
@@ -272,6 +283,41 @@ download_snapshot() {
         print_error "Could not find latest snapshot"
         exit 1
     fi
+    
+    # Display checkpoint status
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📍 CHECKPOINT STATUS"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Check download status
+    if [ -f "$LATEST" ]; then
+        DOWNLOAD_SIZE=$(stat -c%s "$LATEST" 2>/dev/null || stat -f%z "$LATEST" 2>/dev/null || echo 0)
+        DOWNLOAD_MB=$((DOWNLOAD_SIZE / 1024 / 1024))
+        echo "✓ Download checkpoint: Found ${DOWNLOAD_MB}MB of ~30,000MB"
+    else
+        echo "✗ Download checkpoint: Not started"
+    fi
+    
+    # Check extraction status
+    if [ -d "$HOME/backup" ]; then
+        EXTRACT_SIZE=$(du -sm "$HOME/backup" 2>/dev/null | cut -f1)
+        echo "✓ Extraction checkpoint: Found ${EXTRACT_SIZE}MB extracted"
+    elif [ -d "$HOME/${LATEST%.*.*}" ]; then
+        echo "✓ Extraction checkpoint: Complete (alternative directory)"
+    else
+        echo "✗ Extraction checkpoint: Not started"
+    fi
+    
+    # Check final destination
+    if [ -d "$HOME/.koinos" ]; then
+        FINAL_SIZE=$(du -sm "$HOME/.koinos" 2>/dev/null | cut -f1)
+        echo "✓ Installation checkpoint: Found ${FINAL_SIZE}MB in ~/.koinos"
+    else
+        echo "✗ Installation checkpoint: Not completed"
+    fi
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
     
     # Check available disk space before download (need ~60GB for download + extraction)
     AVAILABLE_SPACE=$(df . | awk 'NR==2 {print int($4/1024/1024)}')
@@ -283,8 +329,38 @@ download_snapshot() {
     
     print_status "Downloading: $LATEST (~30GB)"
     
+    # Check if we have a partial download to resume
+    if [ -f "$LATEST" ]; then
+        EXISTING_SIZE=$(stat -c%s "$LATEST" 2>/dev/null || stat -f%z "$LATEST" 2>/dev/null || echo 0)
+        EXISTING_MB=$((EXISTING_SIZE / 1024 / 1024))
+        
+        if [ "$EXISTING_MB" -gt 100 ]; then
+            print_status "Found partial download (${EXISTING_MB}MB), attempting to resume..."
+            # Create a backup in case resume fails
+            cp "$LATEST" "${LATEST}.backup" 2>/dev/null || true
+        else
+            print_status "Found small partial file (${EXISTING_MB}MB), removing and starting fresh..."
+            rm -f "$LATEST"
+        fi
+    fi
+    
+    # Check if we already have extracted data from a previous attempt
+    if [ -d "$HOME/backup" ] || [ -d "$HOME/${LATEST%.*.*}" ] || ([ -d "$HOME/chain" ] && [ -d "$HOME/block_store" ]); then
+        print_status "Found previously extracted data, skipping download..."
+        DOWNLOAD_SUCCESS=true
+        SKIP_DOWNLOAD=true
+    elif [ -d "$HOME/.koinos/chain" ] && [ -d "$HOME/.koinos/block_store" ]; then
+        print_status "Found completed blockchain data in ~/.koinos, skipping download and extraction..."
+        DOWNLOAD_SUCCESS=true
+        SKIP_DOWNLOAD=true
+        SKIP_EXTRACTION=true
+    else
+        SKIP_DOWNLOAD=false
+        SKIP_EXTRACTION=false
+    fi
+    
     # Install aria2c for faster downloads if not present
-    if ! command -v aria2c >/dev/null 2>&1 && ! command -v axel >/dev/null 2>&1; then
+    if [ "$SKIP_DOWNLOAD" = false ] && ! command -v aria2c >/dev/null 2>&1 && ! command -v axel >/dev/null 2>&1; then
         print_status "Installing download accelerators for faster speeds..."
         sudo apt-get update >/dev/null 2>&1
         sudo apt-get install -y aria2 axel >/dev/null 2>&1 || true
@@ -296,9 +372,11 @@ download_snapshot() {
     fi
     
     # Try different download methods for better speed
-    DOWNLOAD_SUCCESS=false
+    if [ "$SKIP_DOWNLOAD" = false ]; then
+        DOWNLOAD_SUCCESS=false
+    fi
     
-    if command -v aria2c >/dev/null 2>&1; then
+    if [ "$SKIP_DOWNLOAD" = false ] && command -v aria2c >/dev/null 2>&1; then
         print_status "Using aria2c for faster multi-connection download..."
         
         # Try up to 3 times with different connection counts
@@ -460,59 +538,193 @@ EOFD
         exit 1
     fi
     
-    print_status "Extracting snapshot (this will use additional ~30GB temporarily)..."
-    
-    # Get total size for progress tracking
-    ARCHIVE_SIZE=$(stat -c%s "$LATEST" 2>/dev/null || stat -f%z "$LATEST" 2>/dev/null)
-    
-    # Install pv for progress monitoring if not available
-    if ! command -v pv >/dev/null 2>&1; then
-        print_status "Installing 'pv' for extraction progress monitoring..."
-        sudo apt-get update >/dev/null 2>&1
-        sudo apt-get install -y pv >/dev/null 2>&1
+    # Check if extraction was already done or partially done
+    EXTRACTION_NEEDED=true
+    if [ -d "$HOME/backup" ]; then
+        print_status "Found 'backup' directory from previous extraction attempt..."
+        BACKUP_SIZE=$(du -sm "$HOME/backup" 2>/dev/null | cut -f1)
+        if [ "$BACKUP_SIZE" -gt 20000 ]; then  # If > 20GB, probably complete
+            print_success "Extraction appears complete (${BACKUP_SIZE}MB), skipping..."
+            EXTRACTION_NEEDED=false
+        else
+            print_warning "Partial extraction found (${BACKUP_SIZE}MB), will resume..."
+            # Keep the partial extraction, tar will skip existing files
+        fi
+    elif [ -d "$HOME/${LATEST%.*.*}" ]; then
+        print_status "Found extracted directory from previous attempt..."
+        EXTRACTION_NEEDED=false
+    elif [ -d "$HOME/chain" ] && [ -d "$HOME/block_store" ]; then
+        print_status "Found extracted blockchain directories in home folder..."
+        EXTRACTION_NEEDED=false
+    elif [ -d "$HOME/.koinos/chain" ] && [ -d "$HOME/.koinos/block_store" ]; then
+        print_success "Blockchain data already in place at ~/.koinos, skipping extraction..."
+        EXTRACTION_NEEDED=false
     fi
     
-    # Extract with progress indicator using pv if available, otherwise use verbose tar
-    if command -v pv >/dev/null 2>&1; then
-        print_status "Extracting with progress indicator..."
-        # Show progress with size, timer, rate, and ETA
-        if ! pv -petrab $LATEST | tar -xzf -; then
-            print_error "Failed to extract snapshot"
-            rm -f $LATEST  # Clean up on extraction failure
+    if [ "$EXTRACTION_NEEDED" = true ] && [ -f "$LATEST" ]; then
+        print_status "Extracting snapshot (this will use additional ~30GB temporarily)..."
+        
+        # Get total size for progress tracking
+        ARCHIVE_SIZE=$(stat -c%s "$LATEST" 2>/dev/null || stat -f%z "$LATEST" 2>/dev/null)
+        
+        # Install tools for faster extraction
+        if ! command -v pv >/dev/null 2>&1; then
+            print_status "Installing 'pv' for extraction progress monitoring..."
+            sudo apt-get update >/dev/null 2>&1
+            sudo apt-get install -y pv >/dev/null 2>&1
+        fi
+        
+        # Install pigz for parallel extraction (MUCH faster)
+        if ! command -v pigz >/dev/null 2>&1; then
+            print_status "Installing 'pigz' for parallel extraction (uses all CPU cores)..."
+            sudo apt-get install -y pigz >/dev/null 2>&1
+        fi
+        
+        # Create extraction wrapper for resume support
+        extract_with_resume() {
+            local MAX_RETRIES=3
+            local RETRY_COUNT=0
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                print_status "Extraction attempt $((RETRY_COUNT + 1)) of $MAX_RETRIES..."
+                
+                # Determine number of CPU cores for parallel extraction
+                CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+                
+                # Use pigz for MUCH faster parallel extraction if available
+                if command -v pigz >/dev/null 2>&1 && command -v pv >/dev/null 2>&1; then
+                    print_status "Using parallel extraction with $CPU_CORES CPU cores..."
+                    print_success "This should be ${CPU_CORES}x faster than standard extraction!"
+                    
+                    # Parallel extraction with progress bar
+                    if pv -petrab $LATEST | pigz -dc -p $CPU_CORES | tar -xf - --skip-old-files 2>/dev/null || \
+                       pv -petrab $LATEST | pigz -dc -p $CPU_CORES | tar -xf -; then
+                        return 0  # Success
+                    else
+                        print_warning "Parallel extraction interrupted or failed, will retry..."
+                        RETRY_COUNT=$((RETRY_COUNT + 1))
+                        sleep 5
+                    fi
+                elif command -v pigz >/dev/null 2>&1; then
+                    print_status "Using parallel extraction with $CPU_CORES CPU cores (no progress bar)..."
+                    
+                    # Parallel extraction without progress bar
+                    if pigz -dc -p $CPU_CORES $LATEST | tar -xf - --skip-old-files 2>/dev/null || \
+                       pigz -dc -p $CPU_CORES $LATEST | tar -xf -; then
+                        return 0  # Success
+                    else
+                        print_warning "Parallel extraction interrupted or failed, will retry..."
+                        RETRY_COUNT=$((RETRY_COUNT + 1))
+                        sleep 5
+                    fi
+                elif command -v pv >/dev/null 2>&1; then
+                    print_status "Extracting with progress indicator (single-threaded, install 'pigz' for ${CPU_CORES}x speedup)..."
+                    # Fallback to standard extraction with progress
+                    if pv -petrab $LATEST | tar -xzf - --skip-old-files 2>/dev/null || \
+                       pv -petrab $LATEST | tar -xzkf - 2>/dev/null || \
+                       pv -petrab $LATEST | tar -xzf -; then
+                        return 0  # Success
+                    else
+                        print_warning "Extraction interrupted or failed, will retry..."
+                        RETRY_COUNT=$((RETRY_COUNT + 1))
+                        sleep 5
+                    fi
+                else
+                    print_status "Extracting (install 'pigz' and 'pv' for ${CPU_CORES}x faster extraction with progress)..."
+                    # Fallback to basic tar
+                    if tar -xzf $LATEST --skip-old-files 2>/dev/null || \
+                       tar -xzkf $LATEST 2>/dev/null || \
+                       tar -xzf $LATEST; then
+                        return 0  # Success
+                    else
+                        print_warning "Extraction interrupted or failed, will retry..."
+                        RETRY_COUNT=$((RETRY_COUNT + 1))
+                        sleep 5
+                    fi
+                fi
+                
+                # Check if we made progress
+                if [ -d "$HOME/backup" ]; then
+                    NEW_SIZE=$(du -sm "$HOME/backup" 2>/dev/null | cut -f1)
+                    print_status "Extracted ${NEW_SIZE}MB so far..."
+                fi
+            done
+            
+            return 1  # Failed after all retries
+        }
+        
+        # Run extraction with resume support
+        if extract_with_resume; then
+            print_success "Extraction completed successfully!"
+            
+            # Only delete archive after successful extraction
+            print_status "Cleaning up archive to free ~30GB..."
+            rm -f $LATEST
+            rm -f "${LATEST}.backup" 2>/dev/null  # Clean up any backup file
+        else
+            print_error "Failed to extract snapshot after multiple attempts"
+            print_status "Archive preserved at: $LATEST"
+            print_status "You can retry by running the script again"
             exit 1
+        fi
+    elif [ "$EXTRACTION_NEEDED" = false ]; then
+        print_status "Skipping extraction, already completed"
+        # Clean up archive if extraction is already done
+        if [ -f "$LATEST" ]; then
+            print_status "Removing archive file to free space..."
+            rm -f $LATEST
+            rm -f "${LATEST}.backup" 2>/dev/null
         fi
     else
-        print_status "Extracting (unable to show progress bar)..."
-        # Use verbose mode to show files being extracted
-        if ! tar -xzvf $LATEST | while read -r line; do
-            # Show a dot every 100 files for basic progress indication
-            COUNT=$((COUNT + 1))
-            if [ $((COUNT % 100)) -eq 0 ]; then
-                echo -n "."
-            fi
-            if [ $((COUNT % 5000)) -eq 0 ]; then
-                echo " ($COUNT files extracted)"
-            fi
-        done; then
-            print_error "Failed to extract snapshot"
-            rm -f $LATEST  # Clean up on extraction failure
-            exit 1
-        fi
-        echo  # New line after dots
+        print_warning "No archive file found to extract"
     fi
     
-    print_status "Cleaning up archive to free ~30GB..."
-    rm -f $LATEST  # Delete archive immediately after extraction to save space
-    
-    # Move to correct location
+    # Move to correct location - check various possible extraction patterns
     if [ -d "backup" ]; then
+        print_status "Moving 'backup' directory to ~/.koinos..."
         mv backup ~/.koinos
     elif [ -d "${LATEST%.*.*}" ]; then
+        print_status "Moving '${LATEST%.*.*}' directory to ~/.koinos..."
         mv "${LATEST%.*.*}" ~/.koinos
+    elif [ -d "chain" ] && [ -d "block_store" ]; then
+        # Files were extracted directly to current directory
+        print_status "Snapshot extracted directly to current directory, organizing..."
+        mkdir -p ~/.koinos
+        
+        # Move all blockchain directories to ~/.koinos
+        for dir in chain block_store account_history contract_meta_store transaction_store mempool p2p grpc jsonrpc; do
+            if [ -d "$dir" ]; then
+                print_status "Moving $dir to ~/.koinos/"
+                mv "$dir" ~/.koinos/ 2>/dev/null || true
+            fi
+        done
+        
+        # Move config file if exists
+        if [ -f "config.yml" ]; then
+            mv config.yml ~/.koinos/ 2>/dev/null || true
+        fi
     else
-        print_error "Could not find extracted snapshot directory"
-        ls -la
-        exit 1
+        # Try to detect any blockchain data directories
+        if ls -d */ 2>/dev/null | grep -qE "(chain|block_store|account_history)"; then
+            print_status "Found blockchain directories, moving to ~/.koinos..."
+            mkdir -p ~/.koinos
+            
+            # Move any recognized blockchain directories
+            for dir in */; do
+                case "$dir" in
+                    chain/|block_store/|account_history/|contract_meta_store/|transaction_store/|mempool/|p2p/|grpc/|jsonrpc/)
+                        print_status "Moving $dir to ~/.koinos/"
+                        mv "$dir" ~/.koinos/ 2>/dev/null || true
+                        ;;
+                esac
+            done
+        else
+            print_error "Could not find extracted snapshot directory structure"
+            print_status "Current directory contents:"
+            ls -la
+            print_status "Expected to find directories like: chain, block_store, account_history"
+            exit 1
+        fi
     fi
     
     print_success "Blockchain snapshot installed and archive cleaned up"
