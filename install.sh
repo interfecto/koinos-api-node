@@ -48,10 +48,27 @@ fi
 
 print_status "Checking system requirements..."
 
-# Check available disk space (need at least 100GB free)
+# Check available disk space - be smart about requirements
 AVAILABLE_SPACE=$(df / | awk 'NR==2 {print int($4/1024/1024)}')
-if [ $AVAILABLE_SPACE -lt 100 ]; then
-    print_error "Insufficient disk space. Need at least 100GB free, found ${AVAILABLE_SPACE}GB"
+
+# Check if blockchain data already exists (then we need less space)
+if [ -d "$HOME/.koinos/chain" ] || [ -d "$HOME/chain" ]; then
+    # Data exists, only need space for Docker operations
+    REQUIRED_SPACE=30
+    print_status "Found existing blockchain data, checking for ${REQUIRED_SPACE}GB free space..."
+else
+    # Need space for download + extraction + final data
+    REQUIRED_SPACE=100
+    print_status "No blockchain data found, checking for ${REQUIRED_SPACE}GB free space for full installation..."
+fi
+
+if [ $AVAILABLE_SPACE -lt $REQUIRED_SPACE ]; then
+    print_error "Insufficient disk space. Need at least ${REQUIRED_SPACE}GB free, found ${AVAILABLE_SPACE}GB"
+    if [ $REQUIRED_SPACE -eq 100 ]; then
+        print_status "Tip: 100GB needed for: 30GB download + 30GB extraction + 30GB final data + buffer"
+    else
+        print_status "Tip: Since you have existing data, only ${REQUIRED_SPACE}GB needed for Docker operations"
+    fi
     exit 1
 fi
 
@@ -319,7 +336,31 @@ download_snapshot() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     
-    # Check available disk space before download (need ~60GB for download + extraction)
+    # Check if we already have the blockchain data in place
+    if [ -d "$HOME/.koinos/chain" ] && [ -d "$HOME/.koinos/block_store" ]; then
+        print_success "Blockchain data already installed at ~/.koinos, skipping download and extraction!"
+        return 0  # Exit the function early
+    fi
+    
+    # Check if we have extracted data that just needs to be moved
+    if [ -d "$HOME/chain" ] && [ -d "$HOME/block_store" ]; then
+        print_success "Found extracted blockchain data, skipping download!"
+        print_status "Moving blockchain directories to ~/.koinos..."
+        mkdir -p ~/.koinos
+        for dir in chain block_store account_history contract_meta_store transaction_store mempool p2p grpc jsonrpc; do
+            if [ -d "$HOME/$dir" ]; then
+                print_status "Moving $dir to ~/.koinos/"
+                mv "$HOME/$dir" ~/.koinos/ 2>/dev/null || true
+            fi
+        done
+        if [ -f "$HOME/config.yml" ]; then
+            mv "$HOME/config.yml" ~/.koinos/ 2>/dev/null || true
+        fi
+        print_success "Blockchain data organized successfully!"
+        return 0  # Exit the function early
+    fi
+    
+    # Only check disk space if we actually need to download
     AVAILABLE_SPACE=$(df . | awk 'NR==2 {print int($4/1024/1024)}')
     if [ $AVAILABLE_SPACE -lt 60 ]; then
         print_error "Insufficient disk space for snapshot. Need at least 60GB free, found ${AVAILABLE_SPACE}GB"
