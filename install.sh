@@ -282,7 +282,53 @@ download_snapshot() {
     fi
     
     print_status "Downloading: $LATEST (~30GB)"
-    wget --progress=bar:force https://backup.koinosblocks.com/$LATEST -O $LATEST
+    
+    # Install aria2c for faster downloads if not present
+    if ! command -v aria2c >/dev/null 2>&1 && ! command -v axel >/dev/null 2>&1; then
+        print_status "Installing aria2c for faster multi-connection downloads..."
+        sudo apt-get update >/dev/null 2>&1
+        sudo apt-get install -y aria2 >/dev/null 2>&1 || true
+    fi
+    
+    # Try different download methods for better speed
+    if command -v aria2c >/dev/null 2>&1; then
+        print_status "Using aria2c for faster multi-connection download..."
+        # Use 16 connections for much faster downloads
+        aria2c -x 16 -s 16 -k 1M --file-allocation=none \
+               --console-log-level=error \
+               --summary-interval=10 \
+               -o $LATEST \
+               https://backup.koinosblocks.com/$LATEST
+    elif command -v axel >/dev/null 2>&1; then
+        print_status "Using axel for faster multi-connection download..."
+        # Use 10 connections for faster downloads
+        axel -n 10 -a -o $LATEST https://backup.koinosblocks.com/$LATEST
+    elif command -v curl >/dev/null 2>&1; then
+        print_status "Using curl for download..."
+        # Curl with optimized settings
+        curl -L --progress-bar \
+             --retry 3 \
+             --retry-delay 5 \
+             --max-time 7200 \
+             --speed-limit 1000 \
+             --speed-time 60 \
+             -o $LATEST \
+             https://backup.koinosblocks.com/$LATEST
+    else
+        print_status "Using wget for download..."
+        # Wget with optimized settings
+        wget --progress=bar:force \
+             --tries=3 \
+             --timeout=60 \
+             --continue \
+             https://backup.koinosblocks.com/$LATEST -O $LATEST
+    fi
+    
+    # Verify download completed
+    if [ ! -f "$LATEST" ]; then
+        print_error "Download failed - file not found"
+        exit 1
+    fi
     
     print_status "Extracting snapshot (this will use additional ~30GB temporarily)..."
     
