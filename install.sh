@@ -273,11 +273,60 @@ download_snapshot() {
         exit 1
     fi
     
-    print_status "Downloading: $LATEST"
+    # Check available disk space before download (need ~60GB for download + extraction)
+    AVAILABLE_SPACE=$(df . | awk 'NR==2 {print int($4/1024/1024)}')
+    if [ $AVAILABLE_SPACE -lt 60 ]; then
+        print_error "Insufficient disk space for snapshot. Need at least 60GB free, found ${AVAILABLE_SPACE}GB"
+        print_status "Tip: The snapshot is ~30GB compressed and needs ~30GB more for extraction"
+        exit 1
+    fi
+    
+    print_status "Downloading: $LATEST (~30GB)"
     wget --progress=bar:force https://backup.koinosblocks.com/$LATEST -O $LATEST
     
-    print_status "Extracting snapshot..."
-    tar -xzf $LATEST
+    print_status "Extracting snapshot (this will use additional ~30GB temporarily)..."
+    
+    # Get total size for progress tracking
+    ARCHIVE_SIZE=$(stat -c%s "$LATEST" 2>/dev/null || stat -f%z "$LATEST" 2>/dev/null)
+    
+    # Install pv for progress monitoring if not available
+    if ! command -v pv >/dev/null 2>&1; then
+        print_status "Installing 'pv' for extraction progress monitoring..."
+        sudo apt-get update >/dev/null 2>&1
+        sudo apt-get install -y pv >/dev/null 2>&1
+    fi
+    
+    # Extract with progress indicator using pv if available, otherwise use verbose tar
+    if command -v pv >/dev/null 2>&1; then
+        print_status "Extracting with progress indicator..."
+        # Show progress with size, timer, rate, and ETA
+        if ! pv -petrab $LATEST | tar -xzf -; then
+            print_error "Failed to extract snapshot"
+            rm -f $LATEST  # Clean up on extraction failure
+            exit 1
+        fi
+    else
+        print_status "Extracting (unable to show progress bar)..."
+        # Use verbose mode to show files being extracted
+        if ! tar -xzvf $LATEST | while read -r line; do
+            # Show a dot every 100 files for basic progress indication
+            COUNT=$((COUNT + 1))
+            if [ $((COUNT % 100)) -eq 0 ]; then
+                echo -n "."
+            fi
+            if [ $((COUNT % 5000)) -eq 0 ]; then
+                echo " ($COUNT files extracted)"
+            fi
+        done; then
+            print_error "Failed to extract snapshot"
+            rm -f $LATEST  # Clean up on extraction failure
+            exit 1
+        fi
+        echo  # New line after dots
+    fi
+    
+    print_status "Cleaning up archive to free ~30GB..."
+    rm -f $LATEST  # Delete archive immediately after extraction to save space
     
     # Move to correct location
     if [ -d "backup" ]; then
@@ -290,10 +339,7 @@ download_snapshot() {
         exit 1
     fi
     
-    # Clean up
-    rm $LATEST
-    
-    print_success "Blockchain snapshot installed"
+    print_success "Blockchain snapshot installed and archive cleaned up"
 }
 
 # Function to create management scripts
