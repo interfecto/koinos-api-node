@@ -53,6 +53,23 @@ if [[ $EUID -eq 0 ]]; then
    exit 1
 fi
 
+# Install essential dependencies if missing
+ESSENTIAL_DEPS="curl wget git"
+MISSING=""
+for dep in $ESSENTIAL_DEPS; do
+    if ! command -v $dep >/dev/null 2>&1; then
+        MISSING="$MISSING $dep"
+    fi
+done
+
+if [ -n "$MISSING" ]; then
+    print_status "Installing essential dependencies:$MISSING"
+    sudo apt-get update >/dev/null 2>&1
+    sudo apt-get install -y $MISSING >/dev/null 2>&1 || {
+        print_warning "Could not install some dependencies"
+    }
+fi
+
 # Check operating system compatibility
 if [ -f /etc/os-release ]; then
     . /etc/os-release
@@ -75,6 +92,21 @@ else
 fi
 
 print_status "Checking system requirements..."
+
+# Check RAM (important for node stability)
+TOTAL_RAM_MB=$(free -m 2>/dev/null | awk 'NR==2{print $2}' || echo "8192")
+TOTAL_RAM_GB=$((TOTAL_RAM_MB / 1024))
+
+if [ "$TOTAL_RAM_MB" -lt 4096 ]; then
+    print_error "Insufficient RAM. Minimum 4GB required, found ${TOTAL_RAM_GB}GB"
+    print_status "Koinos nodes need at least 4GB RAM to run"
+    exit 1
+elif [ "$TOTAL_RAM_MB" -lt 8192 ]; then
+    print_warning "Low RAM detected: ${TOTAL_RAM_GB}GB. Recommended: 8GB+"
+    print_status "Node will run but may be slow under load"
+else
+    print_success "RAM check passed: ${TOTAL_RAM_GB}GB available"
+fi
 
 # Check available disk space - be smart about requirements
 AVAILABLE_SPACE=$(df "$HOME" 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}' || df / | awk 'NR==2 {print int($4/1024/1024)}')
@@ -182,10 +214,12 @@ configure_firewall() {
     
     # Check if ufw is available
     if command -v ufw >/dev/null 2>&1; then
-        # Enable firewall
-        sudo ufw --force enable
+        # CRITICAL: Set default policies FIRST (before enabling)
+        sudo ufw default deny incoming
+        sudo ufw default allow outgoing
         
-        # Allow SSH (important!)
+        # CRITICAL: Allow SSH BEFORE enabling firewall to prevent lockout!
+        print_status "Allowing SSH to prevent lockout..."
         sudo ufw allow ssh
         
         # Allow Koinos ports
@@ -194,7 +228,10 @@ configure_firewall() {
         sudo ufw allow 8888/tcp comment 'Koinos P2P'
         sudo ufw allow 50051/tcp comment 'Koinos gRPC'
         
-        print_success "Firewall configured"
+        # Enable firewall LAST (after SSH is allowed)
+        sudo ufw --force enable
+        
+        print_success "Firewall configured safely"
     else
         print_warning "UFW firewall not available. Please configure firewall manually."
     fi
@@ -1012,10 +1049,13 @@ main() {
     echo
     echo "Your Koinos API node is now running!"
     echo
+    # Get external IP once with fallback
+    EXTERNAL_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || curl -s --max-time 5 icanhazip.com 2>/dev/null || echo "YOUR_SERVER_IP")
+    
     echo "API Endpoints:"
-    echo "• JSON-RPC: http://$(curl -s ifconfig.me):8080"
-    echo "• CORS Proxy (for browsers): http://$(curl -s ifconfig.me):8081"
-    echo "• gRPC: http://$(curl -s ifconfig.me):50051"
+    echo "• JSON-RPC: http://${EXTERNAL_IP}:8080"
+    echo "• CORS Proxy (for browsers): http://${EXTERNAL_IP}:8081"
+    echo "• gRPC: http://${EXTERNAL_IP}:50051"
     echo "• P2P: port 8888"
     echo
     echo "Management Commands:"
